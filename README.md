@@ -64,3 +64,19 @@ Round 8/10 - Global Accuracy: 89.92%, | Time: 14.77s
 Round 9/10 - Global Accuracy: 91.15%, | Time: 15.35s
 Round 10/10 - Global Accuracy: 90.91%, | Time: 15.52s
 Total Training Time: 144.34s
+
+5. FedDyn 
+(FL) hansol@hansol-ui-MacBookAir Federated_Learning % python FedDyn.py
+Device: cpu
+FedDyn Start: 10 rounds, 5 clients, alpha=0.1
+Round 1/10 - Global Accuracy: 31.94%, | Time: 17.07s
+Round 2/10 - Global Accuracy: 51.13%, | Time: 15.29s
+Round 3/10 - Global Accuracy: 61.41%, | Time: 15.33s
+Round 4/10 - Global Accuracy: 67.93%, | Time: 15.38s
+Round 5/10 - Global Accuracy: 71.23%, | Time: 15.24s
+Round 6/10 - Global Accuracy: 73.69%, | Time: 15.40s
+Round 7/10 - Global Accuracy: 76.25%, | Time: 15.70s
+Round 8/10 - Global Accuracy: 77.36%, | Time: 16.55s
+Round 9/10 - Global Accuracy: 78.55%, | Time: 16.58s
+Round 10/10 - Global Accuracy: 80.36%, | Time: 16.62s
+Total Training Time: 159.16s
