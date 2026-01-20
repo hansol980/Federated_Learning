@@ -9,8 +9,9 @@ import time
 
 # 1. Configurations
 args = {
-    'num_clients': 5,
+    'num_clients': 50,
     'num_rounds': 10,
+    'frac': 0.25,
     'epochs': 1,
     'batch_size': 32,
     'lr': 0.01,
@@ -81,6 +82,8 @@ def local_train(model, train_loader):
     model.train()
     optimizer = optim.SGD(model.parameters(), lr=args['lr'])
     criterion = nn.CrossEntropyLoss()
+    total_loss = 0.0
+    total_samples = 0
     
     for epoch in range(args['epochs']):
         for data, target in train_loader:
@@ -90,8 +93,11 @@ def local_train(model, train_loader):
             loss = criterion(output, target)
             loss.backward()
             optimizer.step()
+            total_loss += loss.item() * data.size(0)
+            total_samples += data.size(0)
     
-    return model.state_dict()
+    avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
+    return model.state_dict(), avg_loss
 
 # 5. Federated Averaging
 def fed_avg(global_weights, local_weights_list):
@@ -128,24 +134,31 @@ def main():
     print(f"Federated Learning Start: {args['num_rounds']} rounds, {args['num_clients']} clients")
     total_start_time = time.time()
 
+    m = max(int(args['frac'] * args['num_clients']), 1)
+
     for round in range(args['num_rounds']):
         round_start_time = time.time()
         local_weights_list = []
+        client_losses = []
         
-        for i in range(args['num_clients']):
+        idxs_users = np.random.choice(range(args['num_clients']), m, replace=False)
+        
+        for idx in idxs_users:
             local_model = SimpleCNN().to(args['device'])
             local_model.load_state_dict(global_weights)
             
-            updated_weights = local_train(local_model, client_loaders[i])
+            updated_weights, avg_loss = local_train(local_model, client_loaders[idx])
             local_weights_list.append(updated_weights)
+            client_losses.append(avg_loss)
         
         global_weights = fed_avg(global_weights, local_weights_list)
         
         global_model.load_state_dict(global_weights)
         acc = evaluate(global_model, test_loader)
+        mean_client_loss = float(np.mean(client_losses)) if client_losses else 0.0
         round_end_time = time.time()
         round_duration = round_end_time - round_start_time
-        print(f"Round {round+1}/{args['num_rounds']} - Global Accuracy: {acc:.2f}%, | Time: {round_duration:.2f}s")
+        print(f"Round {round+1}/{args['num_rounds']} - Client Avg Loss: {mean_client_loss:.4f} | Global Accuracy: {acc:.2f}%, | Time: {round_duration:.2f}s")
     
     total_end_time = time.time()
     total_duration = total_end_time - total_start_time

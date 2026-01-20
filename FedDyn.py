@@ -8,8 +8,9 @@ import numpy as np
 import time
 
 args = {
-    'num_clients': 5,
+    'num_clients': 50,
     'num_rounds': 10,
+    'frac': 0.25,
     'epochs': 1,
     'batch_size': 32,
     'lr': 0.01,
@@ -91,6 +92,8 @@ def feddyn_local_train(model, train_loader, global_weights, local_grad_hist, alp
     model.train()
     optimizer = optim.SGD(model.parameters(), lr=args['lr'])
     criterion = nn.CrossEntropyLoss()
+    total_task_loss = 0.0
+    total_samples = 0
     
     global_params = [val.to(args['device']) for val in global_weights.values()]
     hist_params = [val.to(args['device']) for val in local_grad_hist.values()]
@@ -110,14 +113,18 @@ def feddyn_local_train(model, train_loader, global_weights, local_grad_hist, alp
             l2_reg = 0
             
             for param, g_param, h_param in zip(model.parameters(), global_params, hist_params):
-                linear_penalty += torch.sum(g_param * param)
+                linear_penalty += torch.sum(h_param * param)
                 l2_reg += torch.norm(param - g_param)**2
                 
             loss = task_loss - linear_penalty + (alpha / 2) * l2_reg
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10)
             optimizer.step()
-    return model.state_dict()
+            total_task_loss += task_loss.item() * data.size(0)
+            total_samples += data.size(0)
+    
+    avg_task_loss = total_task_loss / total_samples if total_samples > 0 else 0.0
+    return model.state_dict(), avg_task_loss
 
 def evaluate(model, test_loader):
     model.eval()
@@ -149,29 +156,34 @@ def main():
     print(f"FedDyn Start: {args['num_rounds']} rounds, {args['num_clients']} clients, alpha={args['alpha']}")
     total_start_time = time.time()
 
+    m = max(int(args['frac'] * args['num_clients']), 1)
+
     for round in range(args['num_rounds']):
         round_start_time = time.time()
         local_weights_list = []
+        client_losses = []
+        
+        idxs_users = np.random.choice(range(args['num_clients']), m, replace=False)
         
         # --- Client Side Updates ---
-        for i in range(args['num_clients']):
+        for idx in idxs_users:
             local_model = SimpleCNN().to(args['device'])
             local_model.load_state_dict(global_weights) 
             
-            updated_weights = feddyn_local_train(
+            updated_weights, avg_loss = feddyn_local_train(
                 local_model, 
-                client_loaders[i], 
+                client_loaders[idx], 
                 global_weights, 
-                local_grad_histories[i], 
+                local_grad_histories[idx], 
                 args['alpha']
             )
             local_weights_list.append(updated_weights)
+            client_losses.append(avg_loss)
             
             param_diff = subtract_weights(updated_weights, global_weights)
             scaled_diff = scale_weights(param_diff, args['alpha'])
-            local_grad_histories[i] = subtract_weights(local_grad_histories[i], scaled_diff)
+            local_grad_histories[idx] = subtract_weights(local_grad_histories[idx], scaled_diff)
         
-        # --- Server Side Updates ---
         avg_weights = copy.deepcopy(local_weights_list[0])
         for key in avg_weights.keys():
             for i in range(1, len(local_weights_list)):
@@ -194,8 +206,9 @@ def main():
         
         global_model.load_state_dict(global_weights)
         acc = evaluate(global_model, test_loader)
+        mean_client_loss = float(np.mean(client_losses)) if client_losses else 0.0
         round_end_time = time.time()
-        print(f"Round {round+1}/{args['num_rounds']} - Global Accuracy: {acc:.2f}%, | Time: {round_end_time - round_start_time:.2f}s")
+        print(f"Round {round+1}/{args['num_rounds']} - Client Avg Loss: {mean_client_loss:.4f} | Global Accuracy: {acc:.2f}%, | Time: {round_end_time - round_start_time:.2f}s")
     
     total_end_time = time.time()
     print(f"Total Training Time: {total_end_time - total_start_time:.2f}s")
