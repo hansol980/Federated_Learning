@@ -1,0 +1,222 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
+import copy
+import numpy as np
+import time
+
+
+args = {
+    'num_clients': 50,
+    'num_rounds': 10,
+    'frac': 0.25,
+    'epochs': 1,
+    'batch_size': 32,
+    'lr': 0.01,
+    'rho': 0.05,  
+    'device': 'cpu'  
+}
+
+class SAM(torch.optim.Optimizer):
+    def __init__(self, params, base_optimizer, rho=0.05, **kwargs):
+        assert rho >= 0.0, f"Invalid rho, should be non-negative: {rho}"
+        defaults = dict(rho=rho, **kwargs)
+        super(SAM, self).__init__(params, defaults)
+        self.base_optimizer = base_optimizer(self.param_groups, **kwargs)
+        self.param_groups = self.base_optimizer.param_groups
+
+    @torch.no_grad()
+    def first_step(self, zero_grad=False):
+        grad_norm = self._grad_norm()
+        for group in self.param_groups:
+            scale = group["rho"] / (grad_norm + 1e-12)
+
+            for p in group["params"]:
+                if p.grad is None: continue
+                e_w = p.grad * scale.to(p)
+                p.add_(e_w)  
+                self.state[p]["e_w"] = e_w
+
+        if zero_grad: self.zero_grad()
+
+    @torch.no_grad()
+    def second_step(self, zero_grad=False):
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None: continue
+                p.sub_(self.state[p]["e_w"])  
+
+        self.base_optimizer.step()  
+
+        if zero_grad: self.zero_grad()
+
+    @torch.no_grad()
+    def _grad_norm(self):
+        
+        stack = [
+            p.grad.norm(p=2).to(p) if p.grad is not None else torch.zeros(1).to(p)
+            for group in self.param_groups for p in group["params"]
+        ]
+        norm = torch.norm(torch.stack(stack), p=2)
+        return norm
+    
+    def zero_grad(self, set_to_none=False):
+        self.base_optimizer.zero_grad(set_to_none)
+
+
+class SimpleCNN(nn.Module):
+    def __init__(self):
+        super(SimpleCNN, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3)
+        self.fc1 = nn.Linear(64*5*5, 128)
+        self.fc2 = nn.Linear(128, 10)
+        
+    def forward(self, x):
+        x = self.pool(torch.relu(self.conv1(x)))
+        x = self.pool(torch.relu(self.conv2(x)))
+        x = x.view(-1, 64*5*5)
+        x = torch.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+
+def get_dataset(num_clients):
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
+    
+    train_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
+    test_dataset = datasets.MNIST('./data', train=False, download=True, transform=transform)
+    
+    labels = train_dataset.targets.numpy()
+    
+    idxs_sorted = np.argsort(labels)
+    
+    num_shards = num_clients * 2
+    shard_size = int(len(train_dataset) / num_shards)
+    
+    shard_idxs = [i for i in range(num_shards)]
+    
+    client_idx_dict = {i: np.array([], dtype='int64') for i in range(num_clients)}
+    
+    for i in range(num_clients):
+        rand_set = np.random.choice(shard_idxs, 2, replace=False)
+        shard_idxs = list(set(shard_idxs) - set(rand_set))
+        
+        for shard in rand_set:
+            start = shard * shard_size
+            end = (shard + 1) * shard_size
+            
+            client_idx_dict[i] = np.concatenate((client_idx_dict[i], idxs_sorted[start:end]), axis=0)
+            
+    client_loaders = []
+    for i in range(num_clients):
+        client_ds = Subset(train_dataset, client_idx_dict[i])
+        client_loaders.append(DataLoader(client_ds, batch_size=args['batch_size'], shuffle=True))
+        
+    test_loader = DataLoader(test_dataset, batch_size=1000, shuffle=False)
+        
+    return client_loaders, test_loader
+
+
+def local_train(model, train_loader):
+    model.train()
+    
+    
+    base_optimizer = optim.SGD
+    optimizer = SAM(model.parameters(), base_optimizer, rho=args['rho'], lr=args['lr'])
+    
+    criterion = nn.CrossEntropyLoss()
+    total_loss = 0.0
+    total_samples = 0
+    
+    for epoch in range(args['epochs']):
+        for data, target in train_loader:
+            data, target = data.to(args['device']), target.to(args['device'])
+            output = model(data)
+            loss = criterion(output, target)
+            loss.backward() 
+            optimizer.first_step(zero_grad=True)
+            criterion(model(data), target).backward() 
+            optimizer.second_step(zero_grad=True)
+            
+            total_loss += loss.item() * data.size(0)
+            total_samples += data.size(0)
+    
+    avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
+    return model.state_dict(), avg_loss
+
+
+def fed_avg(global_weights, local_weights_list):
+    avg_weights = copy.deepcopy(local_weights_list[0])
+    
+    for key in avg_weights.keys():
+        for i in range(1, len(local_weights_list)):
+            avg_weights[key] += local_weights_list[i][key]
+        avg_weights[key] = torch.div(avg_weights[key], len(local_weights_list))
+    
+    return avg_weights
+
+
+def evaluate(model, test_loader):
+    model.eval()
+    correct = 0
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.to(args['device']), target.to(args['device'])
+            output = model(data)
+            pred = output.argmax(dim=1, keepdim=True)
+            correct += pred.eq(target.view_as(pred)).sum().item()
+    accuracy = 100. * correct / len(test_loader.dataset)
+    return accuracy
+
+def main():
+    print(f"Device: {args['device']}")
+    
+    global_model = SimpleCNN().to(args['device'])
+    global_weights = global_model.state_dict()
+    
+    client_loaders, test_loader = get_dataset(args['num_clients'])
+    
+    print(f"FedSAM Experiment Start: {args['num_rounds']} rounds, {args['num_clients']} clients, rho={args['rho']}")
+    total_start_time = time.time()
+
+    m = max(int(args['frac'] * args['num_clients']), 1)
+
+    for round in range(args['num_rounds']):
+        round_start_time = time.time()
+        local_weights_list = []
+        client_losses = []
+        
+        idxs_users = np.random.choice(range(args['num_clients']), m, replace=False)
+        
+        for idx in idxs_users:
+            local_model = SimpleCNN().to(args['device'])
+            local_model.load_state_dict(global_weights)
+            
+            
+            updated_weights, avg_loss = local_train(local_model, client_loaders[idx])
+            local_weights_list.append(updated_weights)
+            client_losses.append(avg_loss)
+        
+        
+        global_weights = fed_avg(global_weights, local_weights_list)
+        
+        global_model.load_state_dict(global_weights)
+        acc = evaluate(global_model, test_loader)
+        mean_client_loss = float(np.mean(client_losses)) if client_losses else 0.0
+        round_end_time = time.time()
+        round_duration = round_end_time - round_start_time
+        print(f"Round {round+1}/{args['num_rounds']} - Client Avg Loss: {mean_client_loss:.4f} | Global Accuracy: {acc:.2f}% | Time: {round_duration:.2f}s")
+    
+    total_end_time = time.time()
+    total_duration = total_end_time - total_start_time
+    print(f"Total Training Time: {total_duration:.2f}s")
+
+if __name__ == '__main__':
+    main()
